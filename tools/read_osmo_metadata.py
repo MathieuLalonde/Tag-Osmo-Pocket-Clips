@@ -6,9 +6,9 @@ writes as BT.709. The actual profile lives in a QuickTime Keys atom:
     com.dji.camera.ColorGammaSxS = Rec.709 | D-Log | D-Log2
 
 Usage:
-    python read_osmo_metadata.py
-    python read_osmo_metadata.py K:\\DCIM\\DJI_001
-    python read_osmo_metadata.py path\\to\\clip.MP4
+    python tools/read_osmo_metadata.py
+    python tools/read_osmo_metadata.py K:\\DCIM\\DJI_001
+    python tools/read_osmo_metadata.py path\\to\\clip.MP4
 """
 
 from __future__ import annotations
