@@ -1,4 +1,5 @@
 """Tag Osmo Pocket 4P clips in DaVinci Resolve from embedded ColorGammaSxS.
+by Mathieu Lalonde - github.com/mathieulalonde
 
 Install: copy this file into Resolve's Utility Scripts folder
 (see README.md for Windows / macOS / Linux paths).
@@ -17,6 +18,8 @@ import re
 import struct
 import sys
 from collections import Counter
+
+__version__ = "0.2"
 
 
 # Resolve Media Pool clip colors (SetClipColor names).
@@ -72,7 +75,7 @@ KEYWORD_TAGS = {
     "D-Log2": "Osmo D-Log2",
 }
 
-# First matching dropdown string wins. D-Log2 has no native CST in Resolve yet.
+# First matching dropdown string wins. D-Log2 has no native CST; use DCTL as IDT.
 INPUT_COLOR_SPACE = {
     "Rec.709": ("Rec.709", "Rec.709 Gamma 2.4"),
     "D-Log": ("DJI D-Gamut/D-Log", "DJI D-Log"),
@@ -114,7 +117,8 @@ DEFAULT_OPTIONS = {
     "write_keywords": False,
     "set_clip_color": False,
     "set_input_color_space": False,
-    "set_dlog2_input_lut": False,
+    "clear_input_luts": True,  # when setting Input CS; preserve_existing wins
+    "set_dlog2_input_lut": False,  # Rec.709 cube fallback when DCTL unused
     "dlog2_lut_vivid": False,
     "preserve_existing": False,  # only fill empty fields / unset colors
     "run_silently": False,
@@ -126,6 +130,8 @@ SCOPE_LABELS = {
     "auto": "Selection if any, else current bin",
     "selected": "Selected clips only",
     "current_bin": "Current bin",
+    # Set only via the timeline gate (not persisted as a normal preference).
+    "timeline_sources": "Clips used on selected timeline(s)",
 }
 
 # Project.GetSetting("colorScienceMode") values that support per-clip Input Color Space.
@@ -208,7 +214,7 @@ def load_options():
                 opts["clip_colors"] = normalize_clip_colors(saved["clip_colors"])
     except (OSError, ValueError, TypeError):
         pass
-    if opts.get("scope") not in SCOPE_LABELS:
+    if opts.get("scope") not in ("auto", "selected", "current_bin"):
         opts["scope"] = "auto"
     opts["clip_colors"] = normalize_clip_colors(opts.get("clip_colors"))
     return opts
@@ -297,6 +303,33 @@ def _pick_best_lut(paths):
     return sorted(paths, key=_lut_rank, reverse=True)[0]
 
 
+def find_dlog2_dctl():
+    """Locate Thatcher Freeman DJI D-Log2 → DWG DCTL (RCM IDT substitute).
+
+    Expected name: ``DJI DLog2 to DWG.dctl`` under Resolve's LUT folder.
+    Also accepts any ``.dctl`` whose name contains dlog2/d-log2 and dwg.
+    """
+    hits = []
+    for root in lut_search_roots():
+        for dirpath, _dirs, files in os.walk(root):
+            for filename in files:
+                lower = filename.lower()
+                if not lower.endswith(".dctl"):
+                    continue
+                has_dlog2 = "dlog2" in lower or "d-log2" in lower
+                if has_dlog2 and "dwg" in lower:
+                    hits.append(os.path.join(dirpath, filename))
+    if not hits:
+        return None
+
+    def _dctl_rank(path):
+        name = os.path.basename(path).lower()
+        exact = 1 if name == "dji dlog2 to dwg.dctl" else 0
+        return (exact, len(name))
+
+    return sorted(hits, key=_dctl_rank, reverse=True)[0]
+
+
 def find_dlog2_luts():
     """Locate DJI Pocket 4P D-Log2 → Rec.709 cubes.
 
@@ -334,6 +367,13 @@ def resolve_dlog2_lut_path(lut_info, vivid):
     if vivid:
         return lut_info.get("vivid") or lut_info.get("standard")
     return lut_info.get("standard") or lut_info.get("vivid")
+
+
+def dctl_owns_dlog2(options):
+    """True when Set Input Color Space will apply the D-Log2 → DWG DCTL."""
+    return bool(options.get("set_input_color_space")) and bool(
+        options.get("_dlog2_dctl")
+    )
 
 
 def lut_property_values(abs_path):
@@ -378,6 +418,18 @@ def try_set_input_lut(clip, abs_path, project=None):
             except Exception:
                 continue
     return None
+
+
+def try_clear_input_lut(clip):
+    """Clear clip Input LUT. Returns True if a clear call appeared to succeed."""
+    for key in ("Input LUT", "3D Input LUT"):
+        for value in ("", "None", "No LUT"):
+            try:
+                if clip.SetClipProperty(key, value):
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def clip_has_input_lut(clip):
@@ -785,8 +837,232 @@ def collect_clips(pool, scope):
     return clips, "bin '%s'" % bin_name
 
 
+def clip_type(clip):
+    try:
+        value = clip.GetClipProperty("Type")
+    except Exception:
+        value = None
+    if not value:
+        try:
+            props = clip.GetClipProperty() or {}
+            value = props.get("Type")
+        except Exception:
+            value = ""
+    return str(value or "").strip()
+
+
+def clip_display_name(clip):
+    try:
+        name = clip.GetName()
+    except Exception:
+        name = None
+    if not name:
+        try:
+            name = clip.GetClipProperty("Clip Name")
+        except Exception:
+            name = None
+    return name or "(unnamed)"
+
+
+def unique_clip_key(clip):
+    try:
+        uid = clip.GetUniqueId()
+        if uid:
+            return "id:%s" % uid
+    except Exception:
+        pass
+    path = clip_file_path(clip)
+    if path:
+        return "path:%s" % os.path.normcase(os.path.normpath(path))
+    return "name:%s" % clip_display_name(clip)
+
+
+def is_timeline_clip(clip, project=None):
+    """True for Media Pool timeline items (Type=Timeline, or matched project timeline)."""
+    if clip_type(clip).lower() == "timeline":
+        return True
+    # Offline media also lacks a file path — only treat as timeline when it matches one.
+    if clip_file_path(clip) or project is None:
+        return False
+    return find_timeline_for_pool_item(project, clip) is not None
+
+
+def find_timeline_for_pool_item(project, clip):
+    """Match a Media Pool timeline item to a Project Timeline object."""
+    uid = None
+    try:
+        uid = clip.GetUniqueId()
+    except Exception:
+        uid = None
+    name = clip_display_name(clip)
+    matches = []
+    try:
+        count = int(project.GetTimelineCount() or 0)
+    except Exception:
+        count = 0
+    for index in range(1, count + 1):
+        try:
+            timeline = project.GetTimelineByIndex(index)
+        except Exception:
+            timeline = None
+        if not timeline:
+            continue
+        try:
+            if uid and timeline.GetUniqueId() == uid:
+                return timeline
+        except Exception:
+            pass
+        try:
+            if timeline.GetName() == name:
+                matches.append(timeline)
+        except Exception:
+            continue
+    # Ambiguous names: fail closed so we never expand the wrong timeline.
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _track_items(timeline, track_type, track_index):
+    items = None
+    try:
+        items = timeline.GetItemListInTrack(track_type, track_index)
+    except Exception:
+        items = None
+    if items is None:
+        try:
+            items = timeline.GetItemsInTrack(track_type, track_index)
+        except Exception:
+            items = None
+    if isinstance(items, dict):
+        return list(items.values())
+    return list(items or [])
+
+
+def media_clips_used_in_timeline(timeline):
+    """Unique Media Pool items with a file path used on the timeline."""
+    found = []
+    seen = set()
+    for track_type in ("video", "audio"):
+        try:
+            track_count = int(timeline.GetTrackCount(track_type) or 0)
+        except Exception:
+            track_count = 0
+        for track_index in range(1, track_count + 1):
+            for item in _track_items(timeline, track_type, track_index):
+                try:
+                    mpi = item.GetMediaPoolItem()
+                except Exception:
+                    mpi = None
+                if not mpi or not clip_file_path(mpi):
+                    continue
+                key = unique_clip_key(mpi)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(mpi)
+    return found
+
+
+def classify_pool_items(clips, project):
+    """Split Media Pool items into media / timelines / other."""
+    media = []
+    timelines = []
+    other = []
+    for clip in clips or []:
+        if is_timeline_clip(clip, project):
+            timelines.append(clip)
+        elif clip_file_path(clip):
+            media.append(clip)
+        else:
+            other.append(clip)
+    return media, timelines, other
+
+
+def expand_timeline_source_clips(project, timeline_clips):
+    """Unique media clips used on the given Media Pool timeline items."""
+    expanded = []
+    seen = set()
+    expand_bits = []
+    ignored = []
+    for tl_clip in timeline_clips or []:
+        name = clip_display_name(tl_clip)
+        timeline = find_timeline_for_pool_item(project, tl_clip)
+        if not timeline:
+            ignored.append(
+                "%s  —  timeline not found (or name matches more than one)" % name
+            )
+            continue
+        used = media_clips_used_in_timeline(timeline)
+        added = 0
+        for mpi in used:
+            key = unique_clip_key(mpi)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(mpi)
+            added += 1
+        expand_bits.append("%s → %d source clip(s)" % (name, added))
+    return expanded, expand_bits, ignored
+
+
+def prepare_clips(pool, project, scope):
+    """Resolve which Media Pool items to tag.
+
+    - Media clips are tagged.
+    - Timelines mixed into a selection/bin are ignored (listed in the report).
+    - Scope ``timeline_sources`` (from the timeline gate) expands selected
+      timeline(s) to their source media — never an implicit whole-bin fallback.
+    """
+    if scope == "timeline_sources":
+        selected = pool.GetSelectedClips() or []
+        _media, timelines, other = classify_pool_items(selected, project)
+        ignored = []
+        for clip in other:
+            ctype = clip_type(clip) or "no file path"
+            ignored.append(
+                "%s  —  ignored (%s)" % (clip_display_name(clip), ctype)
+            )
+        expanded, expand_bits, expand_ignored = expand_timeline_source_clips(
+            project, timelines
+        )
+        ignored.extend(expand_ignored)
+        if expanded:
+            label = "timeline source clips (%s)" % "; ".join(expand_bits)
+            return expanded, label, ignored
+        return [], "selected timeline(s)", ignored
+
+    raw, source = collect_clips(pool, scope)
+    media = []
+    timelines = []
+    ignored = []
+
+    for clip in raw:
+        name = clip_display_name(clip)
+        if is_timeline_clip(clip, project):
+            timelines.append(clip)
+            continue
+        if clip_file_path(clip):
+            media.append(clip)
+            continue
+        ctype = clip_type(clip) or "no file path"
+        ignored.append("%s  —  ignored (%s)" % (name, ctype))
+
+    if media:
+        for clip in timelines:
+            ignored.append("%s  —  ignored (timeline)" % clip_display_name(clip))
+        label = source
+        if timelines:
+            label = "%s; ignored %d timeline(s)" % (source, len(timelines))
+        return media, label, ignored
+
+    for clip in timelines:
+        ignored.append("%s  —  ignored (timeline)" % clip_display_name(clip))
+    return [], source, ignored
+
+
 def tag_clip(clip, options, project=None):
-    name = clip.GetName() or clip.GetClipProperty("Clip Name") or "(unnamed)"
+    name = clip_display_name(clip)
     path = clip_file_path(clip)
     if not path:
         return name, None, "no file path (offline?)"
@@ -831,18 +1107,54 @@ def tag_clip(clip, options, project=None):
                 parts.append("color=%s" % clip_color)
 
     if options.get("set_input_color_space", False):
-        if preserve and clip_has_input_color_space(clip):
+        clear_luts = bool(options.get("clear_input_luts", False))
+        if "_dlog2_dctl" not in options:
+            options["_dlog2_dctl"] = find_dlog2_dctl()
+        dctl_path = options.get("_dlog2_dctl")
+
+        if color == "D-Log2":
+            # No native IDT — apply Freeman DCTL as Input LUT when available.
+            if preserve and clip_has_input_lut(clip):
+                parts.append("Input LUT kept")
+            elif dctl_path:
+                applied = try_set_input_lut(clip, dctl_path, project=project)
+                if applied:
+                    parts.append("IDT=D-Log2→DWG DCTL")
+                else:
+                    parts.append("DCTL not set")
+            else:
+                parts.append("no CST for D-Log2")
+                if clear_luts:
+                    if preserve and clip_has_input_lut(clip):
+                        parts.append("Input LUT kept")
+                    elif clip_has_input_lut(clip):
+                        if try_clear_input_lut(clip):
+                            parts.append("Input LUT cleared")
+                        else:
+                            parts.append("Input LUT not cleared")
+        elif preserve and clip_has_input_color_space(clip):
             parts.append("Input CS kept")
         else:
             idt = try_set_input_color_space(clip, color)
             if idt:
                 parts.append("IDT=%s" % idt)
-            elif color == "D-Log2":
-                parts.append("no CST for D-Log2")
             else:
                 parts.append("Input CS not set")
+            if clear_luts:
+                if preserve and clip_has_input_lut(clip):
+                    parts.append("Input LUT kept")
+                elif clip_has_input_lut(clip):
+                    if try_clear_input_lut(clip):
+                        parts.append("Input LUT cleared")
+                    else:
+                        parts.append("Input LUT not cleared")
 
-    if color == "D-Log2" and options.get("set_dlog2_input_lut", False):
+    # Rec.709 cube fallback — skipped when Input CS owns D-Log2 via DCTL.
+    if (
+        color == "D-Log2"
+        and options.get("set_dlog2_input_lut", False)
+        and not dctl_owns_dlog2(options)
+    ):
         if preserve and clip_has_input_lut(clip):
             parts.append("Input LUT kept")
         else:
@@ -904,7 +1216,102 @@ def show_message(title, text):
     win.Hide()
 
 
-def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=None):
+
+def show_timeline_gate_dialog(timeline_names, bin_name):
+    """Ask how to resolve a timeline-only selection.
+
+    Returns ``timeline_sources``, ``current_bin``, or None if cancelled.
+    """
+    try:
+        _resolve, ui, disp = get_ui()
+    except Exception as exc:
+        print("Tag Osmo Pocket Clips: timeline gate UI unavailable (%s)" % exc)
+        return None
+
+    names = [n for n in (timeline_names or []) if n]
+    if not names:
+        names = ["(unnamed timeline)"]
+    if len(names) == 1:
+        heading = "You selected a timeline, not media clips."
+        used_label = "Tag clips used on this timeline"
+        listed = names[0]
+    else:
+        heading = "You selected %d timelines, not media clips." % len(names)
+        used_label = "Tag clips used on these timelines"
+        listed = ", ".join(names[:5])
+        if len(names) > 5:
+            listed = "%s, …" % listed
+
+    bin_label = "Tag clips in current bin '%s'" % (bin_name or "(none)")
+
+    win = disp.AddWindow(
+        {
+            "ID": "OsmoTimelineGateWin",
+            "WindowTitle": "Tag Osmo Pocket Clips",
+            "Geometry": [320, 220, 460, 260],
+        },
+        [
+            ui.VGroup(
+                {"Weight": 1, "Spacing": 8},
+                [
+                    ui.Label(
+                        {
+                            "ID": "GateHeading",
+                            "Text": heading,
+                            "WordWrap": True,
+                            "Weight": 0,
+                        }
+                    ),
+                    ui.Label(
+                        {
+                            "ID": "GateDetail",
+                            "Text": listed,
+                            "WordWrap": True,
+                            "Weight": 0,
+                        }
+                    ),
+                    ui.Label(
+                        {
+                            "Text": "Choose what to tag:",
+                            "WordWrap": True,
+                            "Weight": 0,
+                        }
+                    ),
+                    ui.VGap(4),
+                    ui.Button({"ID": "GateTimeline", "Text": used_label, "Weight": 0}),
+                    ui.Button({"ID": "GateBin", "Text": bin_label, "Weight": 0}),
+                    ui.Button({"ID": "GateCancel", "Text": "Cancel", "Weight": 0}),
+                ],
+            )
+        ],
+    )
+
+    result = {"choice": None}
+
+    def _timeline(_ev):
+        result["choice"] = "timeline_sources"
+        disp.ExitLoop()
+
+    def _bin(_ev):
+        result["choice"] = "current_bin"
+        disp.ExitLoop()
+
+    def _cancel(_ev):
+        result["choice"] = None
+        disp.ExitLoop()
+
+    win.On.GateTimeline.Clicked = _timeline
+    win.On.GateBin.Clicked = _bin
+    win.On.GateCancel.Clicked = _cancel
+    win.On.OsmoTimelineGateWin.Close = _cancel
+
+    win.Show()
+    disp.RunLoop()
+    win.Hide()
+    return result["choice"]
+
+
+def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=None, locked_scope=None, scope_lock_note=None):
     """Return options dict, or None if cancelled / UI unavailable."""
     try:
         _resolve, ui, disp = get_ui()
@@ -912,11 +1319,16 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
         print("Tag Osmo Pocket Clips: options UI unavailable (%s)" % exc)
         return None
 
-    scope_keys = ["auto", "selected", "current_bin"]
-    try:
-        scope_index = scope_keys.index(defaults.get("scope", "auto"))
-    except ValueError:
+    if locked_scope in ("timeline_sources", "current_bin"):
+        scope_keys = [locked_scope]
         scope_index = 0
+    else:
+        scope_keys = ["auto", "selected", "current_bin"]
+        try:
+            scope_index = scope_keys.index(defaults.get("scope", "auto"))
+        except ValueError:
+            scope_index = 0
+    scope_locked = locked_scope in ("timeline_sources", "current_bin")
 
     clip_colors = normalize_clip_colors(defaults.get("clip_colors"))
     # (button_id, swatch_id, profile_label)
@@ -937,8 +1349,12 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
         "Color science: unknown",
     )
     want_input_cs = bool(defaults.get("set_input_color_space", False)) and supports_input_cs
+    dctl_path = find_dlog2_dctl()
     if supports_input_cs:
-        input_cs_text = "Set Input Color Space (D-Log2 not supported)"
+        if dctl_path:
+            input_cs_text = "Set Input Color Space (D-Log2 via DCTL)"
+        else:
+            input_cs_text = "Set Input Color Space (install DCTL for D-Log2)"
     else:
         input_cs_text = "Set Input Color Space — requires Color Managed project"
 
@@ -958,13 +1374,30 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
         vivid_checked = False
         vivid_enabled = False
 
-    want_dlog2_lut = bool(defaults.get("set_dlog2_input_lut", False)) and lut_info["any"]
-    dlog2_lut_text = "Apply D-Log2 Input LUT (if present)"
+    def lut_row_usable(input_cs_on):
+        """Rec.709 cubes only when Input CS is not applying the DCTL."""
+        if not lut_info["any"]:
+            return False
+        if dctl_path and supports_input_cs and input_cs_on:
+            return False
+        return True
+
+    want_dlog2_lut = (
+        bool(defaults.get("set_dlog2_input_lut", False))
+        and lut_row_usable(want_input_cs)
+    )
+    dlog2_lut_text = "Apply D-Log2 Rec.709 LUT (fallback)"
+    want_clear_luts = bool(defaults.get("clear_input_luts", True)) and want_input_cs
+    clear_luts_text = "Clear Input LUTs when setting Input Color Space"
 
     def clip_word(n):
         return "clip" if n == 1 else "clips"
 
     def scope_result_text(scope_key):
+        if scope_lock_note:
+            return scope_lock_note
+        if scope_key == "timeline_sources":
+            return "Will tag clips used on the selected timeline(s)."
         if scope_key == "selected":
             if selected_count:
                 return "Will tag %d selected %s." % (selected_count, clip_word(selected_count))
@@ -980,7 +1413,7 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
         {
             "ID": "OsmoOptWin",
             "WindowTitle": "Tag Osmo Pocket Clips",
-            "Geometry": [300, 140, 480, 560],
+            "Geometry": [300, 140, 500, 600],
         },
         [
             ui.VGroup(
@@ -998,6 +1431,18 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
                         {
                             "ID": "Science",
                             "Text": science_label,
+                            "WordWrap": True,
+                            "Weight": 0,
+                        }
+                    ),
+                    ui.Label(
+                        {
+                            "ID": "DctlStatus",
+                            "Text": (
+                                "D-Log2 DCTL: found"
+                                if dctl_path
+                                else "D-Log2 DCTL: not found (see README)"
+                            ),
                             "WordWrap": True,
                             "Weight": 0,
                         }
@@ -1032,6 +1477,15 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
                             "Weight": 0,
                         }
                     ),
+                    ui.CheckBox(
+                        {
+                            "ID": "ClearInputLUTs",
+                            "Text": clear_luts_text,
+                            "Checked": want_clear_luts,
+                            "Enabled": want_input_cs,
+                            "Weight": 0,
+                        }
+                    ),
                     ui.HGroup(
                         {"Weight": 0, "Spacing": 12},
                         [
@@ -1040,7 +1494,7 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
                                     "ID": "SetDLog2LUT",
                                     "Text": dlog2_lut_text,
                                     "Checked": want_dlog2_lut,
-                                    "Enabled": lut_info["any"],
+                                    "Enabled": lut_row_usable(want_input_cs),
                                     "Weight": 1,
                                 }
                             ),
@@ -1150,6 +1604,10 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
     for label in (SCOPE_LABELS[k] for k in scope_keys):
         items["Scope"].AddItem(label)
     items["Scope"].CurrentIndex = scope_index
+    try:
+        items["Scope"].Enabled = not scope_locked
+    except Exception:
+        pass
 
     # Some UIManager builds ignore constructor Enabled; force after create.
     try:
@@ -1159,8 +1617,18 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
     except Exception:
         pass
     try:
-        items["SetDLog2LUT"].Enabled = lut_info["any"]
-        if not lut_info["any"]:
+        input_cs_on = bool(items["SetInputCS"].Checked) if supports_input_cs else False
+        items["ClearInputLUTs"].Enabled = input_cs_on
+        if not input_cs_on:
+            items["ClearInputLUTs"].Checked = False
+        elif want_clear_luts:
+            items["ClearInputLUTs"].Checked = True
+    except Exception:
+        pass
+    try:
+        lut_ok = lut_row_usable(bool(items["SetInputCS"].Checked) if supports_input_cs else False)
+        items["SetDLog2LUT"].Enabled = lut_ok
+        if not lut_ok:
             items["SetDLog2LUT"].Checked = False
         items["DLog2Vivid"].Checked = vivid_checked
         items["DLog2Vivid"].Enabled = vivid_enabled and bool(items["SetDLog2LUT"].Checked)
@@ -1171,6 +1639,7 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
         apply_swatch(items[swatch_id], chosen_colors[profile])
 
     result = {"cancelled": True, "options": dict(defaults)}
+    clear_pref = bool(defaults.get("clear_input_luts", True))
 
     def _cancel(_ev):
         result["cancelled"] = True
@@ -1193,7 +1662,9 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
         items["ScopeResult"].Text = scope_result_text(scope_keys[idx])
 
     def _sync_vivid_enabled(_ev=None):
-        lut_on = bool(items["SetDLog2LUT"].Checked) if lut_info["any"] else False
+        lut_on = bool(items["SetDLog2LUT"].Checked) and lut_row_usable(
+            bool(items["SetInputCS"].Checked) if supports_input_cs else False
+        )
         try:
             items["DLog2Vivid"].Enabled = vivid_enabled and lut_on
             if only_vivid:
@@ -1203,12 +1674,40 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
         except Exception:
             pass
 
+    def _on_clear_clicked(_ev=None):
+        nonlocal clear_pref
+        if supports_input_cs and bool(items["SetInputCS"].Checked):
+            clear_pref = bool(items["ClearInputLUTs"].Checked)
+
+    def _sync_input_cs_children(_ev=None):
+        nonlocal clear_pref
+        input_cs_on = bool(items["SetInputCS"].Checked) if supports_input_cs else False
+        try:
+            items["ClearInputLUTs"].Enabled = input_cs_on
+            if input_cs_on:
+                items["ClearInputLUTs"].Checked = clear_pref
+            else:
+                clear_pref = bool(items["ClearInputLUTs"].Checked)
+                items["ClearInputLUTs"].Checked = False
+        except Exception:
+            pass
+        try:
+            lut_ok = lut_row_usable(input_cs_on)
+            items["SetDLog2LUT"].Enabled = lut_ok
+            if not lut_ok:
+                items["SetDLog2LUT"].Checked = False
+        except Exception:
+            pass
+        _sync_vivid_enabled()
+
     def _run(_ev):
         idx = int(items["Scope"].CurrentIndex)
         if idx < 0 or idx >= len(scope_keys):
             idx = 0
         set_input = bool(items["SetInputCS"].Checked) if supports_input_cs else False
-        set_lut = bool(items["SetDLog2LUT"].Checked) if lut_info["any"] else False
+        clear_luts = bool(items["ClearInputLUTs"].Checked) if set_input else False
+        lut_ok = lut_row_usable(set_input)
+        set_lut = bool(items["SetDLog2LUT"].Checked) if lut_ok else False
         if only_vivid:
             vivid = True
         elif only_standard:
@@ -1220,6 +1719,7 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
             "write_keywords": bool(items["WriteKeywords"].Checked),
             "set_clip_color": bool(items["SetClipColor"].Checked),
             "set_input_color_space": set_input,
+            "clear_input_luts": clear_luts,
             "set_dlog2_input_lut": set_lut,
             "dlog2_lut_vivid": vivid,
             "preserve_existing": bool(items["PreserveExisting"].Checked),
@@ -1227,6 +1727,7 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
             "scope": scope_keys[idx],
             "clip_colors": dict(chosen_colors),
             "_dlog2_luts": lut_info,
+            "_dlog2_dctl": dctl_path,
         }
         result["cancelled"] = False
         disp.ExitLoop()
@@ -1235,6 +1736,8 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
     win.On.RunButton.Clicked = _run
     win.On.OsmoOptWin.Close = _cancel
     win.On.Scope.CurrentIndexChanged = _scope_changed
+    win.On.SetInputCS.Clicked = _sync_input_cs_children
+    win.On.ClearInputLUTs.Clicked = _on_clear_clicked
     win.On.SetDLog2LUT.Clicked = _sync_vivid_enabled
     for btn_id, swatch_id, profile in color_rows:
         win.On[btn_id].Clicked = _make_color_pick(profile, btn_id, swatch_id)
@@ -1248,6 +1751,19 @@ def show_options_dialog(defaults, selected_count, bin_name, bin_count, project=N
     return result["options"]
 
 
+def progress_bar_text(index, total, width=40):
+    """Unicode block bar for Resolve UIManager (no native ProgressBar needed)."""
+    if total <= 0:
+        filled = 0
+        pct = 0
+    else:
+        frac = max(0.0, min(1.0, float(index) / float(total)))
+        filled = int(round(frac * width))
+        pct = int(round(frac * 100.0))
+    filled = max(0, min(width, filled))
+    return "%s%s     %d%%" % ("█" * filled, "░" * (width - filled), pct)
+
+
 def begin_progress(total):
     """Non-modal progress window updated during tagging."""
     try:
@@ -1258,14 +1774,22 @@ def begin_progress(total):
         {
             "ID": "OsmoProgWin",
             "WindowTitle": "Tag Osmo Pocket Clips",
-            "Geometry": [360, 280, 420, 120],
+            "Geometry": [360, 280, 440, 150],
         },
         [
             ui.VGroup(
+                {"Spacing": 6},
                 [
                     ui.Label({"ID": "Status", "Text": "Starting…", "Weight": 0}),
+                    ui.Label(
+                        {
+                            "ID": "Bar",
+                            "Text": progress_bar_text(0, total),
+                            "Weight": 0,
+                        }
+                    ),
                     ui.Label({"ID": "Detail", "Text": "", "Weight": 0, "WordWrap": True}),
-                ]
+                ],
             )
         ],
     )
@@ -1280,6 +1804,7 @@ def update_progress(prog, index, name):
     total = prog["total"]
     try:
         prog["items"]["Status"].Text = "Tagging %d of %d…" % (index, total)
+        prog["items"]["Bar"].Text = progress_bar_text(index, total)
         prog["items"]["Detail"].Text = name or ""
         prog["win"].RecalcLayout()
     except Exception:
@@ -1295,7 +1820,17 @@ def end_progress(prog):
         pass
 
 
-def format_report(clips_count, source, options, counts, lines, failures):
+def format_report(
+    clips_count,
+    source,
+    options,
+    counts,
+    lines,
+    failures,
+    ignored=None,
+    cancelled=False,
+    planned=None,
+):
     enabled = []
     if options.get("write_metadata"):
         enabled.append("metadata")
@@ -1306,22 +1841,45 @@ def format_report(clips_count, source, options, counts, lines, failures):
         mapping = ", ".join("%s=%s" % (k, colors[k]) for k in ("Rec.709", "D-Log", "D-Log2"))
         enabled.append("clip color (%s)" % mapping)
     if options.get("set_input_color_space"):
-        enabled.append("Input Color Space")
-    if options.get("set_dlog2_input_lut"):
+        if options.get("_dlog2_dctl"):
+            enabled.append("Input Color Space (+ D-Log2 DCTL)")
+        else:
+            enabled.append("Input Color Space")
+        if options.get("clear_input_luts"):
+            enabled.append("clear Input LUTs")
+    if options.get("set_dlog2_input_lut") and not dctl_owns_dlog2(options):
         kind = "vivid" if options.get("dlog2_lut_vivid") else "standard"
-        enabled.append("D-Log2 Input LUT (%s)" % kind)
+        enabled.append("D-Log2 Rec.709 LUT (%s)" % kind)
     if options.get("preserve_existing"):
         enabled.append("keep existing")
 
+    ignored = ignored or []
+    if cancelled:
+        total = planned if planned is not None else clips_count
+        head = "Cancelled after %d of %d %s from %s." % (
+            clips_count,
+            total,
+            "clip" if total == 1 else "clips",
+            source,
+        )
+    else:
+        head = "Tagged %d %s from %s." % (
+            clips_count,
+            "clip" if clips_count == 1 else "clips",
+            source,
+        )
     parts = [
-        "Tagged %d %s from %s." % (clips_count, "clip" if clips_count == 1 else "clips", source),
+        head,
         "Actions: %s" % (", ".join(enabled) if enabled else "(none)"),
         "",
         "Counts: " + ", ".join("%s=%d" % item for item in sorted(counts.items())),
     ]
+    if ignored:
+        parts.extend(["", "Ignored (%d):" % len(ignored), "\n".join(ignored)])
     if failures:
         parts.extend(["", "Problems (%d):" % len(failures), "\n".join(failures)])
     parts.extend(["", "Clips:", "\n".join(lines) if lines else "(none)"])
+    parts.extend(["", "Script version %s" % __version__])
     return "\n".join(parts)
 
 
@@ -1351,19 +1909,54 @@ def main():
     bin_clips = (folder.GetClipList() if folder else None) or []
     bin_name = folder.GetName() if folder else "(none)"
 
+    defaults = load_options()
+    scope_pref = defaults.get("scope", "auto")
+    locked_scope = None
+    scope_lock_note = None
+
+    media_sel, timeline_sel, _other_sel = classify_pool_items(selected, project)
+    if timeline_sel and not media_sel:
+        choice = show_timeline_gate_dialog(
+            [clip_display_name(c) for c in timeline_sel],
+            bin_name,
+        )
+        if choice is None:
+            return
+        locked_scope = choice
+        defaults = dict(defaults)
+        defaults["scope"] = locked_scope
+        if locked_scope == "timeline_sources":
+            if len(timeline_sel) == 1:
+                scope_lock_note = (
+                    "Locked: clips used on timeline '%s'."
+                    % clip_display_name(timeline_sel[0])
+                )
+            else:
+                scope_lock_note = (
+                    "Locked: clips used on %d selected timelines."
+                    % len(timeline_sel)
+                )
+        else:
+            scope_lock_note = "Locked: current bin '%s'." % bin_name
+
     options = show_options_dialog(
-        load_options(),
+        defaults,
         len(selected),
         bin_name,
         len(bin_clips),
         project=project,
+        locked_scope=locked_scope,
+        scope_lock_note=scope_lock_note,
     )
     if options is None:
         return
 
-    # Don't persist ephemeral LUT scan payload.
+    # Don't persist ephemeral LUT / DCTL scan payloads or gate-only scopes.
     to_save = dict(options)
     to_save.pop("_dlog2_luts", None)
+    to_save.pop("_dlog2_dctl", None)
+    if to_save.get("scope") == "timeline_sources":
+        to_save["scope"] = scope_pref if scope_pref != "timeline_sources" else "auto"
     save_options(to_save)
 
     if not (
@@ -1376,13 +1969,18 @@ def main():
         show_message("Tag Osmo Pocket Clips", "Nothing selected to do. Enable at least one action.")
         return
 
-    clips, source = collect_clips(pool, options.get("scope", "auto"))
+    clips, source, ignored = prepare_clips(pool, project, options.get("scope", "auto"))
     if not clips:
-        show_message(
-            "Tag Osmo Pocket Clips",
-            "No clips to tag for scope '%s'.\nSelect clips or open a bin that contains them."
+        bits = [
+            "No media clips to tag for scope '%s'."
             % SCOPE_LABELS.get(options.get("scope"), options.get("scope")),
-        )
+            "",
+            "Timelines mixed with media are ignored. A timeline-only selection opens a",
+            "gate so you can tag clips used on that timeline, or the current bin.",
+        ]
+        if ignored:
+            bits.extend(["", "Ignored:"] + ignored)
+        show_message("Tag Osmo Pocket Clips", "\n".join(bits))
         return
 
     counts = Counter()
@@ -1400,15 +1998,31 @@ def main():
             counts[color or "skipped"] += 1
             line = "%s  —  %s" % (name, note)
             lines.append(line)
-            if color is None or "unset:" in note or "missing file" in note or "no file path" in note:
+            if (
+                color is None
+                or "unset:" in note
+                or "missing file" in note
+                or "no file path" in note
+            ):
                 failures.append(line)
     finally:
         end_progress(prog)
 
+    if ignored:
+        counts["ignored"] = counts.get("ignored", 0) + len(ignored)
+
     if silent:
         return
 
-    report = format_report(len(clips), source, options, counts, lines, failures)
+    report = format_report(
+        len(lines),
+        source,
+        options,
+        counts,
+        lines,
+        failures,
+        ignored=ignored,
+    )
     print(report)
     show_message("Tag Osmo Pocket Clips — Results", report)
 
