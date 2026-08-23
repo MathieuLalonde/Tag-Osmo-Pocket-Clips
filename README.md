@@ -1,10 +1,10 @@
-# Osmo Pocket 4P Metadata Extractor and Tagger for DaVinci Resolve
+# Tag Osmo Pocket Clips - 4P Metadata Extractor and Tagger for DaVinci Resolve
 
-Tools to read the real color profile from Osmo Pocket 4P MP4s and tag clips in DaVinci Resolve.
+Tools to read the real color profile information from Osmo Pocket 4P MP4s and tag that metadata to the clips inside DaVinci Resolve.
 
 The Osmo Pocket 4P introduced a new color profile: D-Log2. Unfortunately, this profile is only supported by one of it's two camera sensors, the second being limited to D-log. Add to that the various fast and slow modes in Rec.709 and you quickly end up having to deal with multiple color profiles in a project shot on a single device. Unfortunately, the metadata stored within the footage files is cannot currently be read by Davinci Resolve, making it harder to sort and grade clips correctly.
 
-This script aims to solve this problem by reading all the metadata stored within the footage files and writing it to the Resolve metadata.
+This script aims to solve this problem by reading all the metadata stored within the footage files and writing it to the Resolve metadata. The clips themselves are never modified.
 
 DJI stores `com.dji.camera.ColorGammaSxS` (`Rec.709`, `D-Log`, `D-Log2`) in the QuickTime keys atom, but every clip’s HEVC `colr` box stays BT.709 (`nclx 1/1/1`). Resolve only sees that standard tag, so the three profiles look identical on import. This project reads the DJI key and writes Resolve metadata (and optional clip attributes) so you can sort and grade correctly.
 
