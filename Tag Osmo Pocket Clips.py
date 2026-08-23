@@ -19,7 +19,7 @@ import struct
 import sys
 from collections import Counter
 
-__version__ = "0.2"
+__version__ = "0.2.1"
 
 
 # Resolve Media Pool clip colors (SetClipColor names).
@@ -79,8 +79,19 @@ KEYWORD_TAGS = {
 INPUT_COLOR_SPACE = {
     "Rec.709": ("Rec.709", "Rec.709 Gamma 2.4"),
     "D-Log": ("DJI D-Gamut/D-Log", "DJI D-Log"),
-    "D-Log2": (),
+    "D-Log2": (),  # no native IDT; DWG tag only after Freeman DCTL
 }
+
+# LUT output of DJI DLog2 to DWG.dctl. Applied only when that DCTL is set.
+# Combined-mode menu is DaVinci Intermediate → DaVinci WG/Intermediate.
+DLOG2_DCTL_INPUT_COLOR_SPACE = (
+    "DaVinci WG/Intermediate",
+    "DaVinci WG / Intermediate",
+    "DaVinci Wide Gamut / DaVinci Intermediate",
+    "DaVinci Wide Gamut/DaVinci Intermediate",
+    "DaVinci Wide Gamut",
+)
+DLOG2_DCTL_INPUT_GAMMA = ("DaVinci Intermediate",)
 
 COLOR_SPACE_NOTES = {
     "Rec.709": "Rec.709",
@@ -809,15 +820,47 @@ def build_metadata(keys, color):
     }
 
 
-def try_set_input_color_space(clip, color):
-    candidates = INPUT_COLOR_SPACE.get(color, ())
+def clip_input_color_space(clip):
+    try:
+        current = clip.GetClipProperty("Input Color Space")
+    except Exception:
+        return ""
+    return str(current).strip() if current else ""
+
+
+def try_set_input_color_space(clip, color, candidates=None):
+    if candidates is None:
+        candidates = INPUT_COLOR_SPACE.get(color, ())
     for name in candidates:
         try:
-            if clip.SetClipProperty("Input Color Space", name):
-                return name
+            ok = clip.SetClipProperty("Input Color Space", name)
+        except Exception:
+            ok = False
+        if ok:
+            return name
+        # Some Resolve builds return False even when the dropdown value stuck.
+        current = clip_input_color_space(clip)
+        if current.lower() == name.lower():
+            return current
+    return None
+
+
+def try_set_dlog2_dctl_input_cs(clip):
+    """Tag DCTL output as DWG/DI so RCM does not convert Rec.709 → DWG again."""
+    name = try_set_input_color_space(
+        clip, "D-Log2", DLOG2_DCTL_INPUT_COLOR_SPACE
+    )
+    if not name:
+        return None
+    if name != "DaVinci Wide Gamut":
+        return name
+    for gamma in DLOG2_DCTL_INPUT_GAMMA:
+        try:
+            if clip.SetClipProperty("Input Gamma", gamma):
+                return "%s / %s" % (name, gamma)
         except Exception:
             continue
-    return None
+    return name
 
 
 def collect_clips(pool, scope):
@@ -1120,6 +1163,11 @@ def tag_clip(clip, options, project=None):
                 applied = try_set_input_lut(clip, dctl_path, project=project)
                 if applied:
                     parts.append("IDT=D-Log2→DWG DCTL")
+                    idt = try_set_dlog2_dctl_input_cs(clip)
+                    if idt:
+                        parts.append("CS=%s" % idt)
+                    else:
+                        parts.append("Input CS not set")
                 else:
                     parts.append("DCTL not set")
             else:

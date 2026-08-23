@@ -71,7 +71,7 @@ After you choose, the normal options dialog opens with **Scope locked** (grayed 
 | --- | --- |
 | Write metadata columns | Gamma Notes, Color Space Notes, lens, WB, ISO/EI, camera fields |
 | Write Keywords | `Osmo Rec.709` / `Osmo D-Log` / `Osmo D-Log2` for smart bins |
-| Set Input Color Space | Rec.709 and DJI D-Gamut/D-Log when Color Managed; D-Log2 uses the Freeman DCTL as Input LUT when installed |
+| Set Input Color Space | Rec.709 and DJI D-Gamut/D-Log when Color Managed; D-Log2 uses the Freeman DCTL as Input LUT and tags Input Color Space as **DaVinci WG/Intermediate** |
 | Clear Input LUTs when setting Input Color Space | Clears leftover Input LUTs on Rec.709 / D-Log (and on D-Log2 if no DCTL). Default on; skipped when **Don't replace existing values** and a LUT is already set |
 | Apply D-Log2 Rec.709 LUT (fallback) | DJI Pocket 4P D-Log2 → Rec.709 cube; disabled when Input CS will apply the DCTL. **Use Vivid LUT** when both variants exist |
 | Don’t replace existing values | Skips fields / colors / LUTs that already have a value |
@@ -110,7 +110,7 @@ Any subfolder under that `LUT` root works — the script walks the tree. Prefer 
 
 3. Fully quit and reopen Resolve so it rescans the library. The DCTL should then appear in the LUT browser and in the DCTL OFX dropdown.
 
-With **Set Input Color Space** enabled on a Color Managed project, D-Log2 clips get that DCTL as their Input LUT (IDT substitute). Rec.709 and D-Log still use native Input Color Space.
+With **Set Input Color Space** enabled on a Color Managed project, D-Log2 clips get that DCTL as their Input LUT (IDT substitute) **and** Input Color Space is set to **DaVinci WG/Intermediate** (the combined-mode menu under DaVinci Intermediate). The DCTL outputs DWG/DI; RCM must be told that so it does not treat the result as Rec.709 (the HEVC default) and convert again — that second transform is why D-Log2 looks gray. Rec.709 and D-Log still use native Input Color Space. The Rec.709 cube fallback does **not** set DWG.
 
 The DCTL matrix is estimated (not an official DJI IDT). Prefer it over Rec.709 cubes when grading in DWG.
 
@@ -159,11 +159,11 @@ Suggested project settings:
 | Output color space | Rec.709 Gamma 2.4 (or your delivery) |
 | Clip Input (Rec.709) | Rec.709 (or Rec.709 Gamma 2.4) |
 | Clip Input (D-Log) | DJI D-Gamut/D-Log |
-| Clip Input (D-Log2) | Freeman **DJI DLog2 to DWG.dctl** as Input LUT (via **Set Input Color Space**), or Rec.709 cube fallback |
+| Clip Input (D-Log2) | Freeman **DJI DLog2 to DWG.dctl** as Input LUT **and** Input Color Space = **DaVinci WG/Intermediate** (via **Set Input Color Space**), or Rec.709 cube fallback |
 
 What that does:
 
-- Resolve converts **camera Input → DWG** automatically for each clip (D-Log2 via DCTL → DWG/DI)
+- Resolve converts **camera Input → DWG** automatically for each clip (D-Log2: DCTL → DWG/DI, then Input tagged DWG so RCM does not convert twice)
 - You grade in wide gamut
 - Resolve converts **DWG → Output** on monitoring / deliver
 
@@ -191,7 +191,11 @@ Licensed under the MIT License — see [LICENSE](LICENSE).
 
 ## Changelog
 
-### v0.2
+### v0.2.1
+
+- After the D-Log2 → DWG DCTL, also set clip Input Color Space to **DaVinci WG/Intermediate**. Rec.709 cube fallback is unchanged.
+
+### v0.2.0
 
 - Prefer Thatcher Freeman’s **D-Log2 → DWG DCTL** as the RCM IDT when installed (Resolve Studio); keep DJI Rec.709 cubes as fallback
 - **Clear Input LUTs when setting Input Color Space** (default on) so leftover cubes don’t double-transform under RCM
